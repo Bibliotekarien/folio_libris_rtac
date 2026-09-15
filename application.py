@@ -21,6 +21,8 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+import metrics
+
 logger = logging.getLogger("rtac")
 
 # Optional logging for local debugging. Set LOG_LEVEL (e.g. DEBUG, INFO) to
@@ -222,7 +224,11 @@ def get_folio_client(sigel, settings):
             cached = _client_cache.get(sigel)
             if cached and cached[1] > now:
                 return cached[0]
-        client = _new_folio_client(settings)
+        # Only logins on the live lookup path are measured (this function).
+        # /validate-folio-connection logs in too, but that endpoint IS
+        # monitoring — counting its logins would drown the real traffic.
+        with metrics.measured_upstream(sigel, "folio_login"):
+            client = _new_folio_client(settings)
         with _client_cache_lock:
             _client_cache[sigel] = (client, now + FOLIO_CLIENT_TTL)
         return client
@@ -428,7 +434,8 @@ def _probe_edge_connection(settings):
     _edge_rtac_holdings(settings, EDGE_VALIDATE_INSTANCE_ID)
 
 
-def create_rtac_response(folio_client:FolioClient, settings, query):
+def create_rtac_response(folio_client:FolioClient, settings, query,
+                         sigel=metrics.UNKNOWN_SIGEL):
     """Return the holdings for the first matching instance.
 
     The instance is resolved with FolioClient (folio_get_single_object, which
@@ -446,9 +453,14 @@ def create_rtac_response(folio_client:FolioClient, settings, query):
       available but deprecated and lean (no loan type).
 
     All three return a ``{"holdings": [...]}`` envelope.
+
+    ``sigel`` is only a metrics label. The caller vouches for it being a
+    configured sigel (see the label doctrine in metrics.py); callers that
+    cannot — like tests calling this directly — get the UNKNOWN_SIGEL default.
     """
     full_path = "/instance-storage/instances" + query
-    search = folio_client.folio_get_single_object(full_path)
+    with metrics.measured_upstream(sigel, "folio_instance_search"):
+        search = folio_client.folio_get_single_object(full_path)
     instances = search.get("instances", [])
     if not instances:
         logger.debug("No instance found for query %r", query)
@@ -456,11 +468,14 @@ def create_rtac_response(folio_client:FolioClient, settings, query):
     instance_id = instances[0]["id"]
     backend = (settings.get("rtac_backend") or DEFAULT_RTAC_BACKEND).strip().lower()
     if backend == "rtac-cache":
-        rtac = folio_client.folio_get_single_object("/rtac-cache/{}".format(instance_id))
+        with metrics.measured_upstream(sigel, "folio_rtac_cache"):
+            rtac = folio_client.folio_get_single_object("/rtac-cache/{}".format(instance_id))
     elif backend == "edge":
-        rtac = _edge_rtac_holdings(settings, instance_id)
+        with metrics.measured_upstream(sigel, "edge_rtac"):
+            rtac = _edge_rtac_holdings(settings, instance_id)
     elif backend == "rtac":
-        rtac = folio_client.folio_get_single_object("/rtac/{}".format(instance_id))
+        with metrics.measured_upstream(sigel, "folio_rtac"):
+            rtac = folio_client.folio_get_single_object("/rtac/{}".format(instance_id))
     else:
         raise RuntimeError(
             "Unknown rtac_backend {!r}; expected one of {}".format(
@@ -488,16 +503,17 @@ def fetch_holdings(sigel, settings, query):
     """
     client = get_folio_client(sigel, settings)
     try:
-        return create_rtac_response(client, settings, query)
+        return create_rtac_response(client, settings, query, sigel=sigel)
     except Exception as exc:
         if not _is_auth_error(exc):
             raise
         logger.warning(
             "Auth error for %s; refreshing FOLIO client and retrying", sigel
         )
+        metrics.record_auth_retry(sigel)
         _invalidate_client(sigel)
         client = get_folio_client(sigel, settings)
-        return create_rtac_response(client, settings, query)
+        return create_rtac_response(client, settings, query, sigel=sigel)
 
 
 # Libris documentation for the loan-status ("lånestatus") gateway this service
@@ -688,24 +704,44 @@ def rtac(
         "request from rate limiting.",
     ),
 ):
-    settings = load_settings(sigel)
-    query = build_identifier_query(
-        {"Bib_ID": Bib_ID, "ONR": ONR, "ISSN": ISSN, "ISBN": ISBN},
-        settings.get("identifier_type_ids", {}),
-    )
-    if query is None:
-        raise ValueError(
-            "No searchable identifier provided (a value with a configured UUID)."
+    # The finally block records the request into the metrics exactly once,
+    # whichever way it ends. Exceptions still propagate to handle_error, which
+    # serves the placeholder XML — outcome classification does not change the
+    # response. The sigel label starts as the placeholder and is upgraded only
+    # once load_settings has vouched for it: the path segment is
+    # client-controlled, and unchecked label values would let anyone mint new
+    # time series (see the label doctrine in metrics.py).
+    started = time.perf_counter()
+    label_sigel = metrics.UNKNOWN_SIGEL
+    channel = "public"
+    outcome = "error"
+    try:
+        settings = load_settings(sigel)
+        label_sigel = sigel
+        channel = "fast_track" if _is_fast_track(request) else "public"
+        query = build_identifier_query(
+            {"Bib_ID": Bib_ID, "ONR": ONR, "ISSN": ISSN, "ISBN": ISBN},
+            settings.get("identifier_type_ids", {}),
         )
+        if query is None:
+            outcome = "no_identifier"
+            raise ValueError(
+                "No searchable identifier provided (a value with a configured UUID)."
+            )
 
-    holdings = fetch_holdings(sigel, settings, query)
-    if not holdings:
-        root = empty_item_information()
-    else:
-        root = etree.Element("Item_Information")
-        for holding in holdings:
-            append_item(root, holding_values(holding))
-    return Response(etree.tostring(root), media_type="text/xml")
+        holdings = fetch_holdings(sigel, settings, query)
+        outcome = "holdings" if holdings else "empty"
+        if not holdings:
+            root = empty_item_information()
+        else:
+            root = etree.Element("Item_Information")
+            for holding in holdings:
+                append_item(root, holding_values(holding))
+        return Response(etree.tostring(root), media_type="text/xml")
+    finally:
+        metrics.record_request(
+            label_sigel, channel, outcome, time.perf_counter() - started
+        )
 
 
 @application.get("/{sigel}/validate-folio-connection")
@@ -823,6 +859,15 @@ def handle_rate_limit(request: Request, exc: RateLimitExceeded):
         "Rate limit hit for %s from %s", request.url.path, get_remote_address(request)
     )
     if request.url.path.endswith("/rtac"):
+        # Throttled requests never reach the endpoint, so they are recorded
+        # here. Channel is "public" by definition: a valid fast-track token
+        # costs 0 and is never throttled. The sigel is sanitized against the
+        # configured set before it may become a label value (doctrine in
+        # metrics.py); no duration — nothing was looked up.
+        sigel = request.path_params.get("sigel")
+        if sigel not in available_sigels():
+            sigel = metrics.UNKNOWN_SIGEL
+        metrics.record_request(sigel, "public", "rate_limited")
         return Response(
             etree.tostring(empty_item_information()), media_type="text/xml"
         )
@@ -839,6 +884,13 @@ def handle_error(request: Request, e: Exception):
     # Don't echo the exception text to the client — it can leak internal paths,
     # FOLIO URLs, or stack details. The full error is logged above.
     return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
+# Opt-in: serves /metrics on its own port only when METRICS_PORT is set (see
+# metrics.py). On import so it works under both uvicorn and __main__; assumes
+# a single process — with multiple uvicorn workers each would need its own
+# port (prometheus_client's multiprocess mode is the proper fix there).
+metrics.start_exporter_if_configured()
 
 
 if __name__ == "__main__":

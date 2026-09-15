@@ -155,6 +155,49 @@ Every endpoint is scoped to a library sigel as the first path segment.
   the list of configured sigels.
 - `GET /docs` — interactive API documentation.
 
+## Metrics (optional)
+
+The service can expose Prometheus metrics — **off by default**. Unless the
+`METRICS_PORT` environment variable is set, nothing new listens and nothing
+changes, so operators who don't want metrics can ignore this section entirely.
+
+To try it locally:
+
+    METRICS_PORT=9105 uv run uvicorn application:application --port 5000
+    curl localhost:9105/metrics
+
+`METRICS_HOST` (default `0.0.0.0`) sets the bind address. In Docker, use the
+ready-made overlay instead — see [docker-compose.metrics.yml](docker-compose.metrics.yml).
+The exporter deliberately runs on its own port, never as a route on the app
+port: the app port is typically fronted by a public reverse proxy, and metrics
+should be reachable only by your monitoring.
+
+What is exported:
+
+| Metric | Labels | What it tells you |
+| --- | --- | --- |
+| `rtac_requests_total` | `sigel`, `channel`, `outcome` | lookups in, by how they ended: `holdings` / `empty` / `error` / `no_identifier` / `rate_limited`. `channel` separates Libris's fast-track URL (`fast_track`) from `public` traffic |
+| `rtac_request_seconds` | `sigel` | lookup duration histogram |
+| `rtac_upstream_requests_total` | `sigel`, `target`, `status` | outbound calls per upstream API (`folio_login`, `folio_instance_search`, `folio_rtac`, `folio_rtac_cache`, `edge_rtac`), with the HTTP status or a synthetic one (`timeout`, `connect_error`, `transport_error`, `error`) |
+| `rtac_upstream_request_seconds` | `target` | upstream call duration histogram |
+| `rtac_folio_auth_retries_total` | `sigel` | lookups retried with a fresh FOLIO login after a 401/403 |
+
+The `error` outcome is the signal HTTP-level monitoring cannot see: this
+service always answers 200 with valid XML even when FOLIO is down (the `Okänd`
+placeholder — see "Always answers" above), so upstream failures never show in
+status codes. `rate(rtac_requests_total{outcome="error"}[5m])` does show them.
+
+**No personal data.** Label values come only from configuration or fixed
+vocabularies — never identifier values, client IPs, tokens, or dates. Requests
+for unknown sigels are recorded under the single label value `_unknown`, so
+arbitrary URLs cannot create new time series. The full doctrine is documented
+at the top of [metrics.py](metrics.py).
+
+The exporter assumes a single application process (the default here, and how
+the container runs). With multiple uvicorn workers each process keeps its own
+counters and only one can bind the port — that setup needs
+`prometheus_client`'s multiprocess mode instead.
+
 ## Deployment
 
 See [DEPLOY.md](DEPLOY.md) for running in Docker behind a Caddy reverse proxy.

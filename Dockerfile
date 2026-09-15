@@ -12,7 +12,7 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # Application code
-COPY application.py ./
+COPY application.py metrics.py ./
 
 # Per-library settings (libraries/<sigel>/settings.json) contain FOLIO
 # credentials and are NOT baked into the image — mount them at /app/libraries

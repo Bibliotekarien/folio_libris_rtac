@@ -1,0 +1,26 @@
+# Optional overlay: expose the Prometheus /metrics exporter.
+#
+# The base docker-compose.yml never enables metrics — operators who do nothing
+# get no new port and no new endpoint. To opt in, put two lines in .env:
+#
+#     COMPOSE_FILE=docker-compose.yml:docker-compose.metrics.yml
+#     METRICS_BIND_IP=10.0.0.4        # the address your Prometheus scrapes —
+#                                     # typically private/internal, never public
+#
+# and `docker compose up -d`. COMPOSE_FILE in .env (rather than `-f` flags on
+# the command line) makes the choice stick: every plain `docker compose`
+# invocation — including scripts/deploy.sh — keeps the overlay, instead of
+# silently dropping the metrics port on the next deploy.
+#
+# Then point your Prometheus at <METRICS_BIND_IP>:9105.
+#
+# The exporter runs on its own port INSIDE the container too (9105, not 5000):
+# the app port is fronted by a public reverse proxy, and metrics must never be
+# reachable that way. What is exported is documented in README.md ("Metrics") —
+# aggregate counters only, no personal data.
+services:
+  rtac:
+    environment:
+      METRICS_PORT: "9105"
+    ports:
+      - "${METRICS_BIND_IP:?set METRICS_BIND_IP in .env to the address Prometheus scrapes}:9105:9105"

@@ -82,6 +82,27 @@ Editing a `libraries/<sigel>/settings.json` takes effect without a rebuild
 (settings are read per request); `docker compose restart rtac` is harmless if
 you prefer.
 
+## Metrics (optional)
+
+To let the central Prometheus (monitoring-vm) scrape the app, enable the
+metrics overlay by putting two lines in `.env` next to `docker-compose.yml`:
+
+    COMPOSE_FILE=docker-compose.yml:docker-compose.metrics.yml
+    METRICS_BIND_IP=10.0.0.4
+
+and running `docker compose up -d` (or `scripts/deploy.sh`). This publishes
+port 9105 on the **private network address only** — never through Caddy. Going
+through `.env` rather than `-f` flags means every later plain
+`docker compose`/`deploy.sh` run keeps the overlay instead of silently
+dropping the metrics port.
+
+Verify from monitoring-vm: `curl http://10.0.0.4:9105/metrics`.
+
+The scrape target (`job_name: rtac` → `10.0.0.4:9105`) lives in the
+**observability-platform** repo. Deploy order matters: enable the overlay
+here **first**, then the scrape target — a dead target pages within minutes
+(TargetNere).
+
 ## Verify
 
     docker compose ps                                                  # rtac healthy
