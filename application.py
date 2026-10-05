@@ -21,9 +21,18 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+import jsonlog
 import metrics
 
 logger = logging.getLogger("rtac")
+# One line per lookup, at INFO — so it only shows when LOG_FORMAT=json or
+# LOG_LEVEL=info asks for it. A child logger, so it can be silenced on its own.
+request_logger = logging.getLogger("rtac.request")
+
+# Opt-in: LOG_FORMAT=json switches all output to one JSON object per line,
+# tagged with the library's sigel (see jsonlog.py). Before the LOG_LEVEL block
+# so that an explicit level still has the last word.
+jsonlog.configure_if_requested()
 
 # Optional logging for local debugging. Set LOG_LEVEL (e.g. DEBUG, INFO) to
 # attach a stderr handler and raise the app's log level; at DEBUG this also turns
@@ -689,6 +698,27 @@ def index():
     return HTMLResponse(index_html(available_sigels()))
 
 
+def _vouched_sigel(request):
+    """The request's sigel if it is a configured one, else None.
+
+    For code that runs outside the endpoint (the exception handlers) and needs
+    to tag a log line: the path segment is client-controlled, so it only counts
+    as a sigel once it is found among the configured libraries.
+    """
+    sigel = request.path_params.get("sigel")
+    return sigel if sigel in available_sigels() else None
+
+
+def _logged_identifiers(identifiers):
+    """The identifiers a lookup was asked for, as they go into the log line.
+
+    Only the ones actually supplied, each cut to the length a valid identifier
+    can have — the values are client-controlled, and a megabyte of query string
+    should not become a megabyte of log.
+    """
+    return {name: value[:128] for name, value in identifiers.items() if value}
+
+
 @application.get("/{sigel}/rtac")
 @limiter.limit(lambda: RTAC_RATE_LIMIT, cost=_rtac_cost)
 def rtac(
@@ -711,36 +741,54 @@ def rtac(
     # once load_settings has vouched for it: the path segment is
     # client-controlled, and unchecked label values would let anyone mint new
     # time series (see the label doctrine in metrics.py).
+    #
+    # The same finally block writes the one log line per lookup, under the same
+    # rule: the line is tagged with the sigel only once it has been vouched for
+    # (see the sigel doctrine in jsonlog.py).
     started = time.perf_counter()
     label_sigel = metrics.UNKNOWN_SIGEL
+    log_sigel = None
     channel = "public"
     outcome = "error"
+    identifiers = {"Bib_ID": Bib_ID, "ONR": ONR, "ISSN": ISSN, "ISBN": ISBN}
     try:
         settings = load_settings(sigel)
-        label_sigel = sigel
-        channel = "fast_track" if _is_fast_track(request) else "public"
-        query = build_identifier_query(
-            {"Bib_ID": Bib_ID, "ONR": ONR, "ISSN": ISSN, "ISBN": ISBN},
-            settings.get("identifier_type_ids", {}),
-        )
-        if query is None:
-            outcome = "no_identifier"
-            raise ValueError(
-                "No searchable identifier provided (a value with a configured UUID)."
+        label_sigel = log_sigel = sigel
+        # Everything logged from here down — auth retries, ignored identifiers
+        # — concerns this library, and is tagged as such.
+        with jsonlog.sigel_context(sigel):
+            channel = "fast_track" if _is_fast_track(request) else "public"
+            query = build_identifier_query(
+                identifiers, settings.get("identifier_type_ids", {})
             )
+            if query is None:
+                outcome = "no_identifier"
+                raise ValueError(
+                    "No searchable identifier provided (a value with a configured UUID)."
+                )
 
-        holdings = fetch_holdings(sigel, settings, query)
-        outcome = "holdings" if holdings else "empty"
-        if not holdings:
-            root = empty_item_information()
-        else:
-            root = etree.Element("Item_Information")
-            for holding in holdings:
-                append_item(root, holding_values(holding))
-        return Response(etree.tostring(root), media_type="text/xml")
+            holdings = fetch_holdings(sigel, settings, query)
+            outcome = "holdings" if holdings else "empty"
+            if not holdings:
+                root = empty_item_information()
+            else:
+                root = etree.Element("Item_Information")
+                for holding in holdings:
+                    append_item(root, holding_values(holding))
+            return Response(etree.tostring(root), media_type="text/xml")
     finally:
-        metrics.record_request(
-            label_sigel, channel, outcome, time.perf_counter() - started
+        seconds = time.perf_counter() - started
+        metrics.record_request(label_sigel, channel, outcome, seconds)
+        request_logger.info(
+            "rtac lookup: %s",
+            outcome,
+            extra={
+                "sigel": log_sigel,
+                "outcome": outcome,
+                "channel": channel,
+                "duration_ms": round(seconds * 1000),
+                "identifiers": _logged_identifiers(identifiers),
+            },
         )
 
 
@@ -787,7 +835,11 @@ def validate_folio_connection(sigel: str):
         folio_client = _new_folio_client(settings)
     except Exception as e:
         logger.error(
-            "FOLIO connection validation failed for %s: %s", sigel, e, exc_info=e
+            "FOLIO connection validation failed for %s: %s",
+            sigel,
+            e,
+            exc_info=e,
+            extra={"sigel": sigel},
         )
         return JSONResponse(
             {"status": "error", "detail": "Could not connect to FOLIO: {}".format(e)},
@@ -809,6 +861,7 @@ def validate_folio_connection(sigel: str):
                 sigel,
                 e,
                 exc_info=e,
+                extra={"sigel": sigel},
             )
             return JSONResponse(
                 {
@@ -836,6 +889,7 @@ def validate_folio_connection(sigel: str):
                     sigel,
                     e,
                     exc_info=e,
+                    extra={"sigel": sigel},
                 )
                 return JSONResponse(
                     {
@@ -855,19 +909,22 @@ def validate_folio_connection(sigel: str):
 @application.exception_handler(RateLimitExceeded)
 def handle_rate_limit(request: Request, exc: RateLimitExceeded):
     """A throttled rtac request still gets a valid (empty) RTAC document."""
+    # The sigel is sanitized against the configured set before it may tag the
+    # log line or become a label value (doctrines in jsonlog.py / metrics.py).
+    sigel = _vouched_sigel(request)
     logger.warning(
-        "Rate limit hit for %s from %s", request.url.path, get_remote_address(request)
+        "Rate limit hit for %s from %s",
+        request.url.path,
+        get_remote_address(request),
+        extra={"sigel": sigel},
     )
     if request.url.path.endswith("/rtac"):
         # Throttled requests never reach the endpoint, so they are recorded
         # here. Channel is "public" by definition: a valid fast-track token
-        # costs 0 and is never throttled. The sigel is sanitized against the
-        # configured set before it may become a label value (doctrine in
-        # metrics.py); no duration — nothing was looked up.
-        sigel = request.path_params.get("sigel")
-        if sigel not in available_sigels():
-            sigel = metrics.UNKNOWN_SIGEL
-        metrics.record_request(sigel, "public", "rate_limited")
+        # costs 0 and is never throttled. No duration — nothing was looked up.
+        metrics.record_request(
+            sigel or metrics.UNKNOWN_SIGEL, "public", "rate_limited"
+        )
         return Response(
             etree.tostring(empty_item_information()), media_type="text/xml"
         )
@@ -876,7 +933,13 @@ def handle_rate_limit(request: Request, exc: RateLimitExceeded):
 
 @application.exception_handler(Exception)
 def handle_error(request: Request, e: Exception):
-    logger.error("Error while serving %s: %s", request.url, e, exc_info=e)
+    logger.error(
+        "Error while serving %s: %s",
+        request.url,
+        e,
+        exc_info=e,
+        extra={"sigel": _vouched_sigel(request)},
+    )
     if request.url.path.endswith("/rtac"):
         return Response(
             etree.tostring(empty_item_information()), media_type="text/xml"
