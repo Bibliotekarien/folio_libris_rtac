@@ -103,6 +103,24 @@ The scrape target (`job_name: rtac` → `10.0.0.4:9105`) lives in the
 here **first**, then the scrape target — a dead target pages within minutes
 (TargetNere).
 
+## Structured logs (optional)
+
+To get one JSON line per record, tagged with the library's sigel, add one line
+to `.env` next to `docker-compose.yml`:
+
+    LOG_FORMAT=json
+
+and run `docker compose up -d` (or `scripts/deploy.sh`). The base compose file
+passes the variable through; left unset, logging is unchanged.
+
+Verify on the host: `docker logs rtac --tail 5` should show JSON objects, and a
+lookup for a configured sigel should produce a line with `"sigel": "<sigel>"`.
+
+Routing those lines onward (each library's lines to its own tenant in the
+customer-facing Loki) is done by Alloy and lives in the
+**observability-platform** repo. Enable `LOG_FORMAT=json` here **first**: until
+then no line carries a `sigel`, and Alloy has nothing to route.
+
 ## Verify
 
     docker compose ps                                                  # rtac healthy

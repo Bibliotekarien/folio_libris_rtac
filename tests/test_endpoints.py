@@ -254,7 +254,8 @@ def test_validate_edge_missing_config_503(client, libraries_dir, settings, monke
 
 def test_handle_error_non_rtac_path_returns_json_500():
     request = types.SimpleNamespace(
-        url=types.SimpleNamespace(path="/alpha/validate-folio-connection")
+        url=types.SimpleNamespace(path="/alpha/validate-folio-connection"),
+        path_params={"sigel": "alpha"},
     )
     resp = application.handle_error(request, ValueError("boom"))
     assert resp.status_code == 500
@@ -262,7 +263,10 @@ def test_handle_error_non_rtac_path_returns_json_500():
 
 
 def test_handle_error_rtac_path_returns_xml():
-    request = types.SimpleNamespace(url=types.SimpleNamespace(path="/alpha/rtac"))
+    request = types.SimpleNamespace(
+        url=types.SimpleNamespace(path="/alpha/rtac"),
+        path_params={"sigel": "alpha"},
+    )
     resp = application.handle_error(request, ValueError("boom"))
     assert resp.media_type == "text/xml"
     # etree.tostring() defaults to ASCII, so "ä" comes back as a char reference.

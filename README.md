@@ -198,6 +198,47 @@ the container runs). With multiple uvicorn workers each process keeps its own
 counters and only one can bind the port — that setup needs
 `prometheus_client`'s multiprocess mode instead.
 
+## Structured logs (optional)
+
+The service can log as JSON — **off by default**. Unless `LOG_FORMAT=json` is
+set, logging is unchanged, so operators who don't ship logs anywhere can ignore
+this section entirely.
+
+To try it locally:
+
+    LOG_FORMAT=json uv run uvicorn application:application --port 5000
+
+Every record — the app's, uvicorn's, any library's — then goes to stdout as one
+JSON object per line:
+
+    {"ts": "2026-10-05T09:12:44.031+00:00", "level": "INFO", "logger": "rtac.request", "msg": "rtac lookup: holdings", "sigel": "Z", "outcome": "holdings", "channel": "fast_track", "duration_ms": 212, "identifiers": {"ISBN": "9789100000000"}}
+
+| Field | When | What it tells you |
+| --- | --- | --- |
+| `ts`, `level`, `logger`, `msg` | always | the record itself |
+| `sigel` | lines that concern one library | which library — only ever a *configured* sigel |
+| `outcome`, `channel`, `duration_ms`, `identifiers` | the one line per lookup (`rtac.request`) | how the lookup ended (same vocabulary as the metrics), which channel, how long, and what was asked for |
+| `exc` | errors | the traceback, as one escaped string |
+
+Two properties make the output safe to route by content — for instance sending
+each library's lines to a log store only that library can read:
+
+- **One record, one line.** Messages and tracebacks are JSON-encoded, so text an
+  outsider controls (a request, or an upstream response quoted in an exception)
+  can never start a line of its own. That includes uvicorn's tracebacks, which
+  are otherwise multi-line.
+- **`sigel` is vouched for.** It is set only after the path segment has been
+  matched against the configured libraries; a request for an unknown or
+  misspelled sigel produces lines with no `sigel` field. The rule is the same as
+  for metric labels and is documented at the top of [jsonlog.py](jsonlog.py).
+
+The fast-track token is never part of the lookup line. It does appear in
+uvicorn's access line and in the error line, which both quote the request URL
+as they always have; the access line carries no `sigel`.
+
+`LOG_LEVEL` still works and takes precedence: with `LOG_FORMAT=json` the app
+logs from `INFO` up (one line per lookup); `LOG_LEVEL=warning` silences those.
+
 ## Deployment
 
 See [DEPLOY.md](DEPLOY.md) for running in Docker behind a Caddy reverse proxy.

@@ -25,6 +25,13 @@ services:
       - --proxy-headers
       - --forwarded-allow-ips
       - "*"
+    # Logging is opt-in and passed straight through from .env; both are empty
+    # by default, which leaves the app's logging exactly as it was. Set
+    # LOG_FORMAT=json for one JSON line per record, tagged with the library's
+    # sigel (see README.md, "Structured logs").
+    environment:
+      LOG_FORMAT: ${LOG_FORMAT:-}
+      LOG_LEVEL: ${LOG_LEVEL:-}
     # Per-library settings (with FOLIO credentials) are mounted read-only,
     # so secrets stay out of the image and can be managed on the host.
     volumes:
