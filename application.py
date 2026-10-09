@@ -30,7 +30,7 @@ logger = logging.getLogger("rtac")
 # on httpx, so every outgoing FOLIO/edge HTTP request is logged — request line
 # and status only, not headers or bodies, so the okapi password / edge apiKey are
 # never exposed. Unset (the default, incl. in the container), logging is left to
-# uvicorn and only warnings/errors surface.
+# uvicorn: its access log (one line per request) plus the app's warnings/errors.
 _LOG_LEVEL = os.environ.get("LOG_LEVEL")
 if _LOG_LEVEL:
     _level = getattr(logging, _LOG_LEVEL.strip().upper(), None)
@@ -41,6 +41,46 @@ if _LOG_LEVEL:
             logging.getLogger("httpx").setLevel(logging.DEBUG)
     else:
         logger.warning("Ignoring invalid LOG_LEVEL=%r", _LOG_LEVEL)
+
+# uvicorn's access log writes every request's full URL to stdout, which is
+# shipped to Loki — including a library's fast-track ?token=. Keep the access
+# log (it is needed for incidents), mask the token. Same form as the platform
+# template bibliotekarien-platform/edge/templates/accesslog.py (see LOGGNING.md
+# there), inlined because the image copies only application.py and metrics.py.
+_ACCESS_LOG_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"([?&]token=)[^&#]*"), r"\1_token_"),
+]
+
+
+def mask_access_path(value: str) -> str:
+    for pattern, replacement in _ACCESS_LOG_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
+
+
+class _MaskTokenFilter(logging.Filter):
+    """Rewrites request paths in uvicorn.access records. The line is formatted
+    lazily, so the filter rewrites record.args — walking every arg rather than
+    trusting args[2], so a change in uvicorn's tuple keeps the protection."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple):
+            return True
+        masked = tuple(
+            mask_access_path(a) if isinstance(a, str) and a.startswith("/") else a
+            for a in args
+        )
+        if masked != args:
+            record.args = masked
+        return True
+
+
+# At import: uvicorn configures its loggers before it imports the app, so the
+# filter added here is not reset. Idempotent for re-imports in tests.
+_access_logger = logging.getLogger("uvicorn.access")
+if not any(isinstance(f, _MaskTokenFilter) for f in _access_logger.filters):
+    _access_logger.addFilter(_MaskTokenFilter())
 
 application = FastAPI()
 
@@ -876,7 +916,10 @@ def handle_rate_limit(request: Request, exc: RateLimitExceeded):
 
 @application.exception_handler(Exception)
 def handle_error(request: Request, e: Exception):
-    logger.error("Error while serving %s: %s", request.url, e, exc_info=e)
+    # Masked: the URL may carry the fast-track ?token= (see _MaskTokenFilter).
+    logger.error(
+        "Error while serving %s: %s", mask_access_path(str(request.url)), e, exc_info=e
+    )
     if request.url.path.endswith("/rtac"):
         return Response(
             etree.tostring(empty_item_information()), media_type="text/xml"
