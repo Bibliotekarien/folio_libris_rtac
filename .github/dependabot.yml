@@ -1,0 +1,42 @@
+version: 2
+
+updates:
+  # Python packages in uv.lock. Security alerts already arrive without this
+  # file; this adds the ordinary version updates.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    # Minor/patch updates are batched into one PR per week. Major versions
+    # arrive one at a time, to be read before merging.
+    groups:
+      uv-minor-patch:
+        update-types: [minor, patch]
+
+  # The base image in the Dockerfile, pinned by digest. A new digest under the
+  # same tag (Debian security patches, Python 3.12.x patch releases, a newer
+  # uv) arrives as a PR. The tag is not a version number, so Dependabot never
+  # proposes a new tag: the Python minor version is changed by hand, together
+  # with .python-version, so that CI and the image keep running the same
+  # Python. CI does not build the image, so a green digest PR has not been
+  # through `docker build`.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  # The actions in .github/workflows are pinned by SHA; this keeps the SHA
+  # and the version comment next to it up to date.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
