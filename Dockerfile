@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Pinned by digest so that two builds of the same commit get the same image;
 # Dependabot proposes new digests. Keep the Python version in step with
 # .python-version (which CI uses).

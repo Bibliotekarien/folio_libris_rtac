@@ -16,9 +16,12 @@ updates:
         update-types: [minor, patch]
 
   # The base image in the Dockerfile, pinned by digest. A new digest under the
-  # same tag (security patches, a newer uv) arrives as a PR. The Python
-  # version itself is changed by hand, together with .python-version, so that
-  # CI and the image keep running the same Python.
+  # same tag (Debian security patches, Python 3.12.x patch releases, a newer
+  # uv) arrives as a PR. The tag is not a version number, so Dependabot never
+  # proposes a new tag: the Python minor version is changed by hand, together
+  # with .python-version, so that CI and the image keep running the same
+  # Python. CI does not build the image, so a green digest PR has not been
+  # through `docker build`.
   - package-ecosystem: docker
     directory: /
     schedule:
