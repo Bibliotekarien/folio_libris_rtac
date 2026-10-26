@@ -575,7 +575,7 @@ LIBRIS_LANESTATUS_PDF_URL = (
 HOSTED_SERVICE_URL = "https://rtac.bibliotekarien.se"
 
 # Source code, for libraries that want to run the service themselves.
-SOURCE_CODE_URL = "https://github.com/fontanka16/folio_libris_rtac"
+SOURCE_CODE_URL = "https://github.com/Bibliotekarien/folio_libris_rtac"
 
 _INDEX_PAGE = """<!DOCTYPE html>
 <html lang="sv">
@@ -686,7 +686,7 @@ __LIBRARIES__
     instans finns på <a href="__HOSTED_URL__">__HOSTED_URL__</a> &ndash; testa
     den där, eller hör av er för att få ert bibliotek uppsatt och driftat.
     Vill ni drifta tjänsten själva hämtar ni källkoden på
-    <a href="__SOURCE_URL__">github.com/fontanka16/folio_libris_rtac</a>.
+    <a href="__SOURCE_URL__">github.com/Bibliotekarien/folio_libris_rtac</a>.
   </p>
   <footer>FOLIO Libris RTAC</footer>
 </body>
