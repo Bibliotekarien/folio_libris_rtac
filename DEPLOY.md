@@ -30,23 +30,34 @@ The app trusts `X-Forwarded-*` (uvicorn runs with `--proxy-headers
 1. DNS: point `rtac.bibliotekarien.se` at the server's public IP. Ports 80 and
    443 must be open (Caddy needs them for the Let's Encrypt cert).
 
-2. Get the code (HTTPS — the repo is public, no SSH key needed):
+2. Create the service user and get the code. The stack follows the platform's
+   service-user pattern (bibliotekarien-platform `SERVER_LAYOUT.md`): the
+   checkout is owned by `rtac`, and every git and docker command runs as that
+   user — never as a personal account. HTTPS, the repo is public:
 
-       git clone https://github.com/fontanka16/folio_libris_rtac.git
-       cd folio_libris_rtac
+       sudo useradd --system --uid 1506 --home-dir /opt/rtac --shell /usr/sbin/nologin rtac
+       sudo usermod -aG docker rtac
+       sudo install -d -o rtac -g rtac -m 0755 /opt/rtac
+       sudo -u rtac git clone https://github.com/Bibliotekarien/folio_libris_rtac.git /opt/rtac/app
 
-3. Create the per-library settings (gitignored, live only on the server):
+3. Create the per-library settings (gitignored, live only on the server). They
+   hold FOLIO credentials, so they are not world-readable: owner `rtac`, group
+   `10001` — the uid/gid the container runs as (`appuser` in the Dockerfile) —
+   mode 0640:
 
-       mkdir -p libraries/<sigel>
-       cp libraries/example.settings.json libraries/<sigel>/settings.json
+       sudo -u rtac mkdir -p /opt/rtac/app/libraries/<sigel>
+       sudo -u rtac cp /opt/rtac/app/libraries/example.settings.json /opt/rtac/app/libraries/<sigel>/settings.json
        # edit: FOLIO connection (okapi_url, tenant_id, username, password) +
        # identifier-type UUIDs. Repeat per sigel.
+       sudo chown rtac:10001 /opt/rtac/app/libraries/*/settings.json
+       sudo chmod 0640 /opt/rtac/app/libraries/*/settings.json
 
 4. Start this stack **first** (it creates the `folio_libris_rtac_proxy`
-   network that Caddy joins as external):
+   network that Caddy joins as external), then enable the boot unit:
 
-       docker compose up --build -d
-       docker compose ps          # should show "rtac" healthy after ~15s
+       sudo /opt/rtac/app/scripts/deploy.sh      # healthy after ~15s, or it fails with logs
+       sudo cp /opt/rtac/app/deploy/rtac.service /etc/systemd/system/
+       sudo systemctl daemon-reload && sudo systemctl enable --now rtac.service
 
 5. Wire it into the edge proxy. The two edge changes are already in the `edge`
    repo (the external network + the Caddyfile site block); apply them by
@@ -60,23 +71,20 @@ The app trusts `X-Forwarded-*` (uvicorn runs with `--proxy-headers
 
 ## Updating
 
-One command — pull, rebuild, recreate, and wait until the container is healthy
-(fails with a non-zero exit and recent logs if anything breaks):
+One command — fetch, show the target commit, fast-forward, rebuild, recreate,
+and wait until the container is healthy (fails with a non-zero exit and recent
+logs if anything breaks):
 
-       cd folio_libris_rtac
-       scripts/deploy.sh
+       sudo /opt/rtac/app/scripts/deploy.sh --check   # what would be deployed; changes nothing
+       sudo /opt/rtac/app/scripts/deploy.sh
 
 Useful flags: `--validate` also checks each library's backend API(s) via
 `/validate-folio-connection` after the deploy; `--no-pull` deploys the current
-working tree as-is; `--logs` follows the log afterwards; `--help` lists the
-rest. docker runs via `sudo` by default (`DOCKER=docker` to override).
+checkout as-is; `--logs` follows the log afterwards; `--help` lists the rest,
+including `GIT_REF` / `REQUIRE_SIGNED` for signed releases.
 
-The script just wraps the manual steps, if you prefer to run them yourself:
-
-       cd folio_libris_rtac
-       git pull
-       docker compose up --build -d
-       docker compose logs -f rtac
+The stack is also part of bibliotekarien-platform's `make deploy-all`, which
+runs every stack's `--check` and then each `deploy.sh` in turn.
 
 Editing a `libraries/<sigel>/settings.json` takes effect without a rebuild
 (settings are read per request); `docker compose restart rtac` is harmless if

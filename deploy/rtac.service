@@ -1,0 +1,24 @@
+# Start the rtac stack at boot (bibliotekarien-vps).
+# Install: sudo cp deploy/rtac.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now rtac.service
+# Crash restarts are handled by compose (restart: unless-stopped); the unit is
+# only for boot — hence oneshot + RemainAfterExit, as for the platform's other
+# stacks. No -f: compose reads COMPOSE_FILE from .env, so the metrics overlay
+# (DEPLOY.md) comes up at boot too.
+
+[Unit]
+Description=folio_libris_rtac app stack
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=rtac
+WorkingDirectory=/opt/rtac/app
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
