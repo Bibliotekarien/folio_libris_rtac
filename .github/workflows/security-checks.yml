@@ -1,0 +1,188 @@
+name: security-checks
+
+# Kopia av bibliotekarien-platform/.github/workflows/security-checks.yml, som
+# är kanonisk. Fristående av samma skäl som tests.yml: repot är öppet, och en
+# `uses:`-rad mot det privata plattformsrepot vore oläsbar utifrån (och
+# GitHub tillåter den troligen inte). Allt från `permissions:` och nedåt ska
+# vara identiskt med originalet — bara triggern skiljer, eftersom originalet
+# är ett workflow_call. Synka när originalet ändras; plattformens
+# versionsbevakning öppnar ett ärende när verktygsversionerna bumpas.
+#
+# Hemligheter i hela historiken (gitleaks), kända sårbarheter i lockfilerna
+# (osv-scanner) och en SBOM per commit på main. Inga secrets, läs-only token.
+
+on:
+  pull_request:
+  # Inte redundant mot pull_request: merge-resultatet kan skilja sig från
+  # PR-huvudet, och det är merge-resultatet som deployas.
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  OSV_SCANNER_VERSION: "2.7.0"
+  OSV_SCANNER_SHA256: "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b"
+
+jobs:
+  hemligheter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Hela historiken, inte bara PR:ens diff. En hemlighet som en gång
+          # checkats in finns kvar i historiken även när den tagits bort ur
+          # koden, och ska då betraktas som röjd (eSam ES2026-19 avsnitt 5.5.1).
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Installera gitleaks
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+
+      # Standardreglerna, med ett undantag: den generiska entropiregeln
+      # (`generic-api-key`) gäller inte i testfiler. Den träffade 28 fixturer
+      # i baslinjen 2026-10-28 (`"password": "pw-12345678"`, publika
+      # Libris-postnycklar) och ingenting annat. De konkreta reglerna —
+      # GitHub-token, privata nycklar, molnnycklar — gäller fortfarande även i
+      # tester. Ett enskilt falsklarm utanför testerna undantas med dess
+      # fingeravtryck i repots `.gitleaksignore`, med en kommentar om varför.
+      - name: Konfiguration
+        run: |
+          cat > "$RUNNER_TEMP/gitleaks.toml" <<'EOF'
+          [extend]
+          useDefault = true
+
+          [[rules]]
+          id = "generic-api-key"
+            [[rules.allowlists]]
+            description = "Fixturer i testfiler"
+            paths = [
+              '''(^|/)tests?/''',
+              '''(^|/)conftest\.py$''',
+              '''\.(spec|test)\.[jt]s$''',
+            ]
+          EOF
+
+      # --redact: ett fynd skrivs aldrig i klartext i körningsloggen.
+      - name: gitleaks
+        run: >-
+          "$RUNNER_TEMP/gitleaks" git .
+          --config "$RUNNER_TEMP/gitleaks.toml"
+          --redact --no-banner --verbose
+
+  beroenden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Installera osv-scanner
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+
+      # Läser lockfilerna (uv.lock, package-lock.json …) och slår upp varje
+      # paket mot osv.dev. Röd när ett beroende har en känd sårbarhet.
+      #
+      # Kompletterar Dependabot, ersätter den inte: Dependabot föreslår
+      # uppdateringar med sju dagars cooldown, så en rättning kan stå oanvänd en
+      # dryg vecka utan att något syns. Här syns den i varje PR från dagen
+      # sårbarheten publiceras.
+      #
+      # En sårbarhet som inte går att åtgärda än, eller inte når oss, undantas
+      # i en `osv-scanner.toml` bredvid lockfilen ([[IgnoredVulns]] med id,
+      # reason och ignoreUntil) — aldrig utan skäl och slutdatum.
+      #
+      # Exitkod 128 betyder att inga lockfiler hittades (plattformsrepot,
+      # koha-platform) — då finns inget att kontrollera.
+      - name: osv-scanner
+        run: |
+          set +e
+          "$RUNNER_TEMP/osv-scanner" --recursive --format markdown . > "$RUNNER_TEMP/osv.md"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/osv.md"
+          if [ "$rc" -eq 128 ]; then
+            echo "Inga lockfiler i repot — inget att kontrollera."
+            exit 0
+          fi
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo "## Kända sårbarheter i beroendena"
+              echo
+              cat "$RUNNER_TEMP/osv.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
+
+  # Förteckning över beroendena (CycloneDX) för varje commit på main — det som
+  # driftsätts. Två per lockfil: `drift` utan utvecklingsberoenden (det som
+  # körs i produktion) och `alla` (det som bygget drar in). eSam ES2026-19
+  # avsnitt 5.6.5 räknar båda som miniminivå. Ingen egen verktygskedja:
+  # uv och npm skriver formatet själva.
+  #
+  # Ligger som artefakt på körningen i 90 dagar. Ska den lämnas ut till en
+  # kund är det den från commiten som är driftsatt.
+  sbom:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Installera uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      # git ls-files i stället för find: bara incheckade lockfiler, aldrig
+      # något under node_modules eller en virtuell miljö. uv skriver filen
+      # men ekar den också till stdout; det ekot vill vi inte ha i loggen.
+      - name: Skriv SBOM
+        run: |
+          mkdir -p sbom
+          for lock in $(git ls-files '*uv.lock'); do
+            dir=$(dirname "$lock")
+            namn=$(echo "$dir" | tr '/.' '__')
+            uv export --project "$dir" --frozen --format cyclonedx1.5 \
+              --preview-features sbom-export --no-dev \
+              -o "sbom/${namn}-python-drift.cdx.json" > /dev/null
+            uv export --project "$dir" --frozen --format cyclonedx1.5 \
+              --preview-features sbom-export --all-groups \
+              -o "sbom/${namn}-python-alla.cdx.json" > /dev/null
+          done
+          for lock in $(git ls-files '*package-lock.json'); do
+            dir=$(dirname "$lock")
+            namn=$(echo "$dir" | tr '/.' '__')
+            npm sbom --prefix "$dir" --package-lock-only --sbom-format cyclonedx \
+              --omit dev > "sbom/${namn}-npm-drift.cdx.json"
+            npm sbom --prefix "$dir" --package-lock-only --sbom-format cyclonedx \
+              > "sbom/${namn}-npm-alla.cdx.json"
+          done
+          ls -l sbom
+
+      - name: Spara SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom/
+          if-no-files-found: ignore
+          retention-days: 90
