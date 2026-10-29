@@ -2,13 +2,20 @@
 #
 # Deploy / update the folio_libris_rtac stack on bibliotekarien-vps.
 #
-# Follows the platform's service-user pattern (as teaball and mark-rounding):
-# run as root (or via sudo); every git and docker command runs as the `rtac`
-# service user, which owns the checkout and is in the docker group. Nothing
+# Run as root (or via sudo). git and docker run as root; the checkout and the
+# directory above it must be owned by root and writable only by root. Nothing
 # runs as a personal account.
 #
-# Flow: fetch -> show target -> [signature check] -> ff-only merge -> build +
-# recreate -> wait until healthy -> [per-library validation].
+# Why root and not the `rtac` service user: root runs files from the checkout
+# (this script via sudo, the compose files at boot). If rtac owned them, that
+# user could write code that root then ran — and rtac was in the docker group,
+# which is root in all but name. So rtac owns nothing and is not in the docker
+# group (bibliotekarien-platform SECURITY_REVIEW.md, Risk 1; same change as
+# mark-rounding, teaball, grib-ranker and tOPAC).
+#
+# Flow: ownership checks -> fetch -> show target -> [signature check] ->
+# ff-only merge -> build + recreate -> wait until healthy -> [per-library
+# validation].
 #
 # Fetching is kept apart from updating the working tree, so --check never
 # touches it, and the target commit is printed before it is applied: a
@@ -35,7 +42,6 @@
 #
 # Environment:
 #   APP_DIR          checkout to deploy (default: /opt/rtac/app)
-#   SERVICE_USER     user that owns it and runs docker (default: rtac)
 #   GIT_REMOTE       remote to fetch from (default: origin)
 #   GIT_REF          tag (preferably signed) or branch to deploy (default: main)
 #   REQUIRE_SIGNED   1 = require a valid GPG signature on the tag/commit (default: 0)
@@ -46,7 +52,6 @@
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/rtac/app}"
-SERVICE_USER="${SERVICE_USER:-rtac}"
 GIT_REMOTE="${GIT_REMOTE:-origin}"
 GIT_REF="${GIT_REF:-main}"
 REQUIRE_SIGNED="${REQUIRE_SIGNED:-0}"
@@ -80,21 +85,37 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if ! id "$SERVICE_USER" &>/dev/null; then
-    echo "Service user '$SERVICE_USER' does not exist. Create it with:" >&2
-    echo "  useradd --system --uid 1506 --home-dir /opt/rtac --shell /usr/sbin/nologin $SERVICE_USER" >&2
-    echo "  usermod -aG docker $SERVICE_USER" >&2
-    exit 1
-fi
-
 if [[ ! -d "$APP_DIR/.git" ]]; then
     echo "No git checkout at $APP_DIR (set APP_DIR, or see DEPLOY.md)." >&2
     exit 1
 fi
 
-# Run a command as the service user from the checkout. Arguments are passed as
-# a list, not a string, so nothing is re-parsed by a shell.
-as_rtac() { (cd "$APP_DIR" && sudo -u "$SERVICE_USER" -H "$@"); }
+# The directory above first: whoever can write there can swap out the whole
+# checkout (mv app x; mkdir app), this script included.
+parent=$(dirname "$APP_DIR")
+if [[ -L "$APP_DIR" || "$(stat -c %u "$parent")" != 0 \
+      || -n "$(find "$parent" -maxdepth 0 -perm /022)" ]]; then
+    echo "$parent must be owned by root and not writable by others, and" >&2
+    echo "$APP_DIR must not be a symlink. Fix (DEPLOY.md, \"Root-owned checkout\"):" >&2
+    echo "  chown root:root $parent && chmod 755 $parent" >&2
+    exit 1
+fi
+
+# Refuse to run if anyone but root can write in the checkout; otherwise root
+# runs code a less privileged user could have changed. Group ownership is
+# free: libraries/*/settings.json is root:10001 so the container can read it.
+# Symlinks are always 777 and skipped; what counts is the target.
+# `|| true`: when head stops reading, find gets SIGPIPE, and with pipefail the
+# script would otherwise die silently here instead of saying what is wrong.
+unsafe=$(find "$APP_DIR" ! -type l \( ! -user root -o -perm /022 \) -print | head -5 || true)
+if [[ -n "$unsafe" ]]; then
+    echo "The checkout $APP_DIR is not root-owned and write-protected, e.g.:" >&2
+    echo "$unsafe" >&2
+    echo "Fix as in DEPLOY.md, \"Root-owned checkout\"." >&2
+    exit 1
+fi
+
+cd "$APP_DIR"
 
 log() { printf '\n=> %s\n' "$*"; }
 
@@ -102,25 +123,25 @@ log() { printf '\n=> %s\n' "$*"; }
 
 if [[ $do_pull -eq 1 ]]; then
     log "Fetching $GIT_REMOTE/$GIT_REF (working tree untouched)"
-    as_rtac git fetch --quiet --tags "$GIT_REMOTE"
+    git fetch --quiet --tags "$GIT_REMOTE"
 
     # A tag wins over a branch of the same name; peel it to its commit.
-    if ! target="$(as_rtac git rev-parse --verify --quiet "refs/tags/$GIT_REF^{commit}")" \
-       && ! target="$(as_rtac git rev-parse --verify --quiet "$GIT_REMOTE/$GIT_REF^{commit}")"; then
+    if ! target="$(git rev-parse --verify --quiet "refs/tags/$GIT_REF^{commit}")" \
+       && ! target="$(git rev-parse --verify --quiet "$GIT_REMOTE/$GIT_REF^{commit}")"; then
         echo "Neither tag nor branch '$GIT_REF' found on $GIT_REMOTE." >&2
         exit 1
     fi
-    echo "   now:    $(as_rtac git --no-pager log -1 --format='%h  %s' HEAD)"
-    echo "   target: $(as_rtac git --no-pager log -1 --format='%h  %an  %s' "$target")"
-    as_rtac git --no-pager log --format='     + %h  %s' "HEAD..$target"
+    echo "   now:    $(git --no-pager log -1 --format='%h  %s' HEAD)"
+    echo "   target: $(git --no-pager log -1 --format='%h  %an  %s' "$target")"
+    git --no-pager log --format='     + %h  %s' "HEAD..$target"
 
     if [[ "$REQUIRE_SIGNED" == "1" ]]; then
         log "Verifying GPG signature"
-        if ! as_rtac git verify-tag "$GIT_REF" &>/dev/null \
-           && ! as_rtac git verify-commit "$target" &>/dev/null; then
+        if ! git verify-tag "$GIT_REF" &>/dev/null \
+           && ! git verify-commit "$target" &>/dev/null; then
             echo "ABORTING: '$GIT_REF' ($target) has no valid GPG signature." >&2
             echo "Sign the release (git tag -s), import the release key into" >&2
-            echo "$SERVICE_USER's keyring, or set REQUIRE_SIGNED=0 if you trust the remote." >&2
+            echo "root's keyring, or set REQUIRE_SIGNED=0 if you trust the remote." >&2
             exit 1
         fi
     fi
@@ -128,13 +149,13 @@ fi
 
 if [[ $check_only -eq 1 ]]; then
     log "Dry run: validating the compose configuration (current checkout)"
-    as_rtac docker compose config --quiet && echo "compose config OK"
+    docker compose config --quiet && echo "compose config OK"
     exit 0
 fi
 
 if [[ $do_pull -eq 1 ]]; then
     log "Updating the working tree (fast-forward only)"
-    if ! as_rtac git merge --ff-only --quiet "$target"; then
+    if ! git merge --ff-only --quiet "$target"; then
         echo "Fast-forward failed — local changes or a diverged branch in $APP_DIR." >&2
         exit 1
     fi
@@ -148,13 +169,13 @@ build_flag=()
 [[ $do_build -eq 1 ]] && build_flag=(--build)
 
 log "Starting the stack (docker compose up${build_flag[*]:+ ${build_flag[*]}} -d --wait)"
-if ! as_rtac docker compose up "${build_flag[@]}" -d --wait --wait-timeout "$WAIT_TIMEOUT"; then
+if ! docker compose up "${build_flag[@]}" -d --wait --wait-timeout "$WAIT_TIMEOUT"; then
     echo "Deploy failed — recent logs:" >&2
-    as_rtac docker compose logs --tail 50 "$SERVICE" >&2 || true
+    docker compose logs --tail 50 "$SERVICE" >&2 || true
     exit 1
 fi
 
-as_rtac docker compose ps
+docker compose ps
 
 # --- 3. optional per-library API check --------------------------------------
 
@@ -176,7 +197,7 @@ if [[ $do_validate -eq 1 ]]; then
             # is optional) or on FOLIO being reachable from the host. The image
             # has python; the sigel is passed as argv (never interpolated into
             # code) and url-encoded.
-            if ! as_rtac docker compose exec -T "$SERVICE" python -c '
+            if ! docker compose exec -T "$SERVICE" python -c '
 import json, sys, urllib.error, urllib.request
 from urllib.parse import quote
 sigel = sys.argv[1]
@@ -212,5 +233,5 @@ log "Deploy OK — rtac is healthy."
 
 if [[ $do_logs -eq 1 ]]; then
     log "Following logs (Ctrl-C to stop)"
-    as_rtac docker compose logs -f "$SERVICE"
+    docker compose logs -f "$SERVICE"
 fi

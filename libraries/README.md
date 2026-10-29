@@ -19,7 +19,9 @@ fill in the values:
   the status URL you register for this library in Biblioteksdatabasen
   (`https://<host>/<sigel>/rtac?token=<value>`) so Libris always has the fast
   lane. Leave it empty (`""`) to keep the library public-but-rate-limited.
-  Generate one with `python scripts/issue_token.py <sigel>`.
+  Generate one with `python scripts/issue_token.py <sigel>` (on the server
+  `sudo python3 /opt/rtac/app/scripts/issue_token.py <sigel>`: the file is
+  root-owned; it is rewritten in place, so its `root:10001 0640` stays).
 - `rtac_backend` — which FOLIO API supplies the holdings once the instance is
   resolved. One of:
   - `"rtac-cache"` — mod-rtac-cache `GET /rtac-cache/{id}` via the gateway (okapi
