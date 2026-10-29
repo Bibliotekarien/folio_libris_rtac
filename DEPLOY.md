@@ -30,26 +30,26 @@ The app trusts `X-Forwarded-*` (uvicorn runs with `--proxy-headers
 1. DNS: point `rtac.bibliotekarien.se` at the server's public IP. Ports 80 and
    443 must be open (Caddy needs them for the Let's Encrypt cert).
 
-2. Create the service user and get the code. The stack follows the platform's
-   service-user pattern (bibliotekarien-platform `SERVER_LAYOUT.md`): the
-   checkout is owned by `rtac`, and every git and docker command runs as that
-   user — never as a personal account. HTTPS, the repo is public:
+2. Create the service user and get the code. `/opt/rtac` and the checkout
+   are owned by root and `scripts/deploy.sh` runs git and docker as root; the
+   `rtac` user owns nothing and is **not** in the docker group (see
+   "Root-owned checkout" below). HTTPS, the repo is public:
 
        sudo useradd --system --uid 1506 --home-dir /opt/rtac --shell /usr/sbin/nologin rtac
-       sudo usermod -aG docker rtac
-       sudo install -d -o rtac -g rtac -m 0755 /opt/rtac
-       sudo -u rtac git clone https://github.com/Bibliotekarien/folio_libris_rtac.git /opt/rtac/app
+       sudo install -d -o root -g root -m 0755 /opt/rtac
+       sudo git clone https://github.com/Bibliotekarien/folio_libris_rtac.git /opt/rtac/app
+       sudo chmod -R go-w /opt/rtac/app
 
 3. Create the per-library settings (gitignored, live only on the server). They
-   hold FOLIO credentials, so they are not world-readable: owner `rtac`, group
+   hold FOLIO credentials, so they are not world-readable: owner root, group
    `10001` — the uid/gid the container runs as (`appuser` in the Dockerfile) —
    mode 0640:
 
-       sudo -u rtac mkdir -p /opt/rtac/app/libraries/<sigel>
-       sudo -u rtac cp /opt/rtac/app/libraries/example.settings.json /opt/rtac/app/libraries/<sigel>/settings.json
-       # edit: FOLIO connection (okapi_url, tenant_id, username, password) +
-       # identifier-type UUIDs. Repeat per sigel.
-       sudo chown rtac:10001 /opt/rtac/app/libraries/*/settings.json
+       sudo mkdir -p /opt/rtac/app/libraries/<sigel>
+       sudo cp /opt/rtac/app/libraries/example.settings.json /opt/rtac/app/libraries/<sigel>/settings.json
+       # edit (sudoedit): FOLIO connection (okapi_url, tenant_id, username,
+       # password) + identifier-type UUIDs. Repeat per sigel.
+       sudo chown root:10001 /opt/rtac/app/libraries/*/settings.json
        sudo chmod 0640 /opt/rtac/app/libraries/*/settings.json
 
 4. Start this stack **first** (it creates the `folio_libris_rtac_proxy`
@@ -89,6 +89,49 @@ runs every stack's `--check` and then each `deploy.sh` in turn.
 Editing a `libraries/<sigel>/settings.json` takes effect without a rebuild
 (settings are read per request); `docker compose restart rtac` is harmless if
 you prefer.
+
+## Root-owned checkout
+
+`/opt/rtac` and `/opt/rtac/app` are owned by root, and `scripts/deploy.sh`
+runs git and docker as root. Before this, `rtac` owned both and was in the
+docker group, which gave three ways to root:
+
+- **The docker group is root.** Anyone who can talk to the docker socket can
+  start a container that mounts `/`.
+- **Root ran files rtac could write:** `deploy.sh` (via sudo) and the compose
+  files (`rtac.service` at boot, also through `make deploy-all`).
+- **rtac owned `/opt/rtac`** and could swap out the whole checkout
+  (`mv app x; mkdir app`), scripts included.
+
+`deploy.sh` refuses to run if any of this is true again. The same change was
+made in mark-rounding, teaball, grib-ranker and tOPAC; see Risk 1 in
+bibliotekarien-platform `SECURITY_REVIEW.md`.
+
+**Moving an existing server** (once; the new `deploy.sh` refuses to run
+before). `chown -R root:root` resets the group on `settings.json`, so it is set
+back to `10001` straight after — otherwise the container can no longer read
+its settings:
+
+    sudo chown root:root /opt/rtac
+    sudo chmod 755 /opt/rtac
+    sudo chown -R root:root /opt/rtac/app
+    sudo chown root:10001 /opt/rtac/app/libraries/*/settings.json
+    sudo chmod 0640 /opt/rtac/app/libraries/*/settings.json
+    sudo git -C /opt/rtac/app pull --ff-only
+    sudo chmod -R go-w /opt/rtac/app
+    sudo restorecon -R /opt/rtac/app
+    sudo gpasswd -d rtac docker
+    sudo cp /opt/rtac/app/deploy/rtac.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+
+Then check:
+
+    id rtac                                         # no docker
+    sudo /opt/rtac/app/scripts/deploy.sh --check
+    sudo /opt/rtac/app/scripts/deploy.sh --no-pull --no-build --validate
+
+The last line recreates the container and asks each library's FOLIO through
+the app — it proves the container can still read every `settings.json`.
 
 ## Metrics (optional)
 
