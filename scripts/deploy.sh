@@ -193,15 +193,18 @@ if [[ $do_validate -eq 1 ]]; then
     else
         failed=0
         for sigel in "${sigels[@]}"; do
-            # Run inside the container so we don't depend on the host port (which
-            # is optional) or on FOLIO being reachable from the host. The image
-            # has python; the sigel is passed as argv (never interpolated into
-            # code) and url-encoded.
-            if ! docker compose exec -T "$SERVICE" python -c '
+            # Run in a throwaway container on the stack's network, so we don't
+            # depend on the host port (which is optional) or on FOLIO being
+            # reachable from the host. `run --rm`, not `exec`: a human running
+            # `docker exec` on the server raises a security alert (audit rule,
+            # Risk 9 in bibliotekarien-platform), and a deploy must not. The
+            # image has python; the sigel is passed as argv (never
+            # interpolated into code) and url-encoded.
+            if ! docker compose run --rm --no-deps -T --entrypoint python "$SERVICE" -c '
 import json, sys, urllib.error, urllib.request
 from urllib.parse import quote
-sigel = sys.argv[1]
-url = "http://localhost:5000/%s/validate-folio-connection" % quote(sigel)
+sigel, service = sys.argv[1], sys.argv[2]
+url = "http://%s:5000/%s/validate-folio-connection" % (service, quote(sigel))
 try:
     with urllib.request.urlopen(url, timeout=20) as r:
         code, body = r.status, r.read().decode()
@@ -215,7 +218,7 @@ except ValueError:
     pass
 print("  %-12s HTTP %s  %s" % (sigel, code, body))
 sys.exit(0 if code == 200 else 1)
-' "$sigel"; then
+' "$sigel" "$SERVICE"; then
                 failed=$((failed + 1))
             fi
         done
